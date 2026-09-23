@@ -20,9 +20,11 @@ TOOL_REQUEST_MIDDLEWARE = "tool_request"
 TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
 LLM_REQUEST_MIDDLEWARE = "llm_request"
 LLM_EXECUTION_MIDDLEWARE = "llm_execution"
+LLM_STREAM_TEXT_MIDDLEWARE = "llm_stream_text"
 
 VALID_MIDDLEWARE: set[str] = {
     TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE,
+    LLM_STREAM_TEXT_MIDDLEWARE,
 }
 
 
@@ -148,6 +150,34 @@ def run_tool_execution_middleware(
         TOOL_EXECUTION_MIDDLEWARE, next_call,
         tool_name=tool_name, args=args, original_args=context.pop("original_args", args), **context)
 
+def run_llm_stream_text_middleware(
+    text: str, *, kind: str, **context: Any,
+) -> str:
+    """Synchronously transform live LLM text before Hermes delivers it to user-visible sinks.
+
+    Each callback receives ``text`` plus stream context and may return ``{"text": "..."}``.
+    Fail-open callbacks are isolated; a fail-closed callback exception propagates and prevents
+    delivery of the untransformed text.
+    """
+    from hermes_cli.plugins import _delivery_manager
+
+    manager = _delivery_manager()
+    current = text
+    for callback in list(manager._middleware.get(LLM_STREAM_TEXT_MIDDLEWARE, [])):
+        call_kwargs = middleware_payload(text=current, kind=kind, **context)
+        try:
+            result = callback(**call_kwargs)
+        except Exception as exc:
+            manager._report_hook_failure(
+                LLM_STREAM_TEXT_MIDDLEWARE, callback, call_kwargs, exc, surface="Middleware"
+            )
+            if getattr(callback, "_hermes_failure_mode", "open") == "closed":
+                raise
+            continue
+        if isinstance(result, dict) and isinstance(result.get("text"), str):
+            current = result["text"]
+    return current
+
 
 class _DownstreamExecutionError(Exception):
     """Marks an exception raised BELOW a middleware frame so the frame's own failure handling
@@ -205,6 +235,8 @@ def _run_execution_chain(kind: str, terminal_call: Callable[[Any], Any], **kwarg
             # Runs once per tool/LLM call: a mis-declared callback fails identically every time,
             # so it goes through the manager's warn-once reporter (#111922).
             manager._report_hook_failure(kind, callback, call_kwargs, exc, surface="Middleware")
+            if getattr(callback, "_hermes_failure_mode", "open") == "closed":
+                raise
             if next_succeeded:
                 return next_result
             if next_called:

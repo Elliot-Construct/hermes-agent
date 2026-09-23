@@ -193,21 +193,31 @@ def run_llm_stream_text_middleware(
                 raise LLMStreamMiddlewareRefusal(exc, callback_name=callback_name) from exc
             continue
 
-        if inspect.isawaitable(result):
-            # This hook is deliberately synchronous. Dispose unsupported async results
-            # instead of leaking a coroutine or silently emitting untransformed text.
-            close = getattr(result, "close", None)
-            cancel = getattr(result, "cancel", None)
-            try:
-                if callable(close):
-                    close()
-                elif callable(cancel):
-                    cancel()
-            except Exception:
-                logger.debug("Failed to dispose awaitable llm_stream_text result", exc_info=True)
+        async_result = (
+            inspect.isawaitable(result)
+            or inspect.isasyncgen(result)
+            or callable(getattr(result, "__aiter__", None))
+        )
+        if async_result:
+            # This hook is deliberately synchronous. Dispose awaitables where doing
+            # so is itself synchronous; async generators/iterables are never driven.
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                cancel = getattr(result, "cancel", None)
+                try:
+                    if callable(close):
+                        close()
+                    elif callable(cancel):
+                        cancel()
+                except Exception:
+                    logger.debug(
+                        "Failed to dispose deferred llm_stream_text result",
+                        exc_info=True,
+                    )
 
             exc = TypeError(
-                "llm_stream_text middleware must be synchronous; callback returned an awaitable"
+                "llm_stream_text middleware must be synchronous; "
+                "callback returned an asynchronous/deferred result"
             )
             manager._report_hook_failure(
                 LLM_STREAM_TEXT_MIDDLEWARE, callback, call_kwargs, exc, surface="Middleware"

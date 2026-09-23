@@ -14,7 +14,7 @@ from hermes_cli.middleware import (
 from hermes_cli.plugins import PluginManager
 
 
-def _load_plugin(tmp_path, name: str, register_body: str) -> PluginManager:
+def _load_plugin(tmp_path, monkeypatch, name: str, register_body: str) -> PluginManager:
     home = tmp_path / "home"
     plugin_dir = home / "plugins" / name
     plugin_dir.mkdir(parents=True)
@@ -35,9 +35,7 @@ def _load_plugin(tmp_path, name: str, register_body: str) -> PluginManager:
         encoding="utf-8",
     )
 
-    import os
-
-    os.environ["HERMES_HOME"] = str(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
     manager = PluginManager()
     manager.discover_and_load()
     return manager
@@ -50,6 +48,7 @@ def _use_manager(monkeypatch, manager: PluginManager) -> None:
 def test_execution_failure_mode_is_selected_per_plugin_registration(tmp_path, monkeypatch):
     manager = _load_plugin(
         tmp_path,
+        monkeypatch,
         "failure-policy",
         """
 def fail_open(**kwargs):
@@ -70,6 +69,7 @@ ctx.register_middleware("tool_execution", fail_closed, failure_mode="closed")
 def test_fail_open_execution_keeps_legacy_fallthrough(tmp_path, monkeypatch):
     manager = _load_plugin(
         tmp_path,
+        monkeypatch,
         "fail-open",
         """
 def protect(**kwargs):
@@ -95,6 +95,7 @@ ctx.register_middleware("llm_execution", protect, failure_mode="open")
 def test_fail_closed_execution_blocks_before_provider(tmp_path, monkeypatch):
     manager = _load_plugin(
         tmp_path,
+        monkeypatch,
         "fail-closed-pre",
         """
 def protect(**kwargs):
@@ -120,6 +121,7 @@ ctx.register_middleware("llm_execution", protect, failure_mode="closed")
 def test_fail_closed_execution_propagates_post_provider_failure(tmp_path, monkeypatch):
     manager = _load_plugin(
         tmp_path,
+        monkeypatch,
         "fail-closed-post",
         """
 def protect(**kwargs):
@@ -146,6 +148,7 @@ ctx.register_middleware("llm_execution", protect, failure_mode="closed")
 def test_fail_open_execution_preserves_post_provider_result(tmp_path, monkeypatch):
     manager = _load_plugin(
         tmp_path,
+        monkeypatch,
         "fail-open-post",
         """
 def observe(**kwargs):
@@ -168,6 +171,7 @@ ctx.register_middleware("llm_execution", observe)
 def test_live_text_transform_receives_request_identity_and_rewrites(tmp_path, monkeypatch):
     manager = _load_plugin(
         tmp_path,
+        monkeypatch,
         "stream-transform",
         """
 def transform(**kwargs):
@@ -194,6 +198,7 @@ ctx.register_middleware("llm_stream_text", transform, failure_mode="closed")
 def test_live_text_failure_policy_can_be_open_or_closed(tmp_path, monkeypatch):
     manager = _load_plugin(
         tmp_path,
+        monkeypatch,
         "stream-open",
         """
 def transform(**kwargs):
@@ -208,6 +213,7 @@ ctx.register_middleware("llm_stream_text", transform, failure_mode="open")
 
     manager = _load_plugin(
         tmp_path,
+        monkeypatch,
         "stream-closed",
         """
 def transform(**kwargs):
@@ -222,15 +228,17 @@ ctx.register_middleware("llm_stream_text", transform, failure_mode="closed")
         run_llm_stream_text_middleware("must-not-deliver", kind="text")
 
 
-def test_invalid_failure_mode_is_rejected(tmp_path):
-    with pytest.raises(Exception, match="failure_mode"):
-        _load_plugin(
-            tmp_path,
-            "bad-mode",
-            """
+def test_invalid_failure_mode_is_rejected(tmp_path, monkeypatch):
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "bad-mode",
+        """
 def callback(**kwargs):
     return None
 
 ctx.register_middleware("llm_execution", callback, failure_mode="maybe")
 """,
-        )
+    )
+
+    assert "failure_mode" in (manager._plugins["bad-mode"].error or "")

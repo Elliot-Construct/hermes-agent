@@ -105,9 +105,31 @@ def test_interim_is_transformed_before_interim_callback(monkeypatch):
             (text, already_streamed)
         )
     )
-    agent._emit_interim_assistant_message({"content": "token"})
+    agent._emit_interim_assistant_message({"content": "token"}, live=True)
 
     assert delivered == [("interim:token", False)]
+
+
+def test_post_response_interim_skips_live_transform(monkeypatch):
+    delivered = []
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("live transform must not run after provider completion")
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_stream_text_middleware",
+        fail_if_called,
+    )
+
+    agent = _Agent()
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: delivered.append(
+            (text, already_streamed)
+        )
+    )
+    agent._emit_interim_assistant_message({"content": "already restored"})
+
+    assert delivered == [("already restored", False)]
 
 
 def test_fail_closed_transform_error_prevents_text_delivery(monkeypatch):

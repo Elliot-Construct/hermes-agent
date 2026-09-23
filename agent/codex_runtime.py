@@ -401,7 +401,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         # display.show_commentary=false keeps mid-turn narration off the interim path too (codex_responses contract).
         if isinstance(text, str) and text.strip() and getattr(agent, "show_commentary", True):
             agent_cb("_emit_interim_assistant_message", "_emit_interim_assistant_message raised",
-                     args=({"role": "assistant", "content": text},))
+                     args=({"role": "assistant", "content": text},), kwargs={"live": True})
         # Each agentMessage item is its own delivered message: the completed item was just compared
         # against ITS deltas, so drop them before the next item's deltas arrive. Otherwise the buffer
         # holds "commentary + final", the final agentMessage no longer prefix-matches, and it is

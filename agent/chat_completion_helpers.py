@@ -2842,12 +2842,22 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._fire_tool_gen_started(name)
 
     def _route_suppressed_text(self, text: str) -> None:
-        """Tool-call turns suppress content streaming (no chatty preamble), but
-        reasoning tags inside it must still reach the display: route through
-        the delta callback for tag extraction (the CLI drops non-reasoning text
-        once the stream box is closed)."""
-        if self.agent.stream_delta_callback:
-            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
+        """Tool-call turns suppress ordinary content, but any bytes that still reach the
+        display/recording edge must pass the synchronous live-text policy first.
+
+        The transform runs outside the best-effort callback wrapper: a fail-closed
+        refusal is a security decision, not a display error. The transformed chunk
+        still goes directly to the callback so split think-tag extraction and the
+        existing tool-turn suppression semantics are preserved.
+        """
+        text = self.agent._transform_live_text(text, kind="text")
+        if text and self.agent.stream_delta_callback:
+            self._quiet(
+                lambda: (
+                    self.agent.stream_delta_callback(text),
+                    self.agent._record_streamed_assistant_text(text),
+                )
+            )
 
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
@@ -3418,6 +3428,12 @@ class _StreamingCall(StreamingWaitMonitor):
         if self._request_cancelled["value"]:
             logger.debug("Streaming worker caught %s after request cancellation — exiting without retry.", type(e).__name__)
             return False
+        from hermes_cli.middleware import LLMStreamMiddlewareRefusal
+        if isinstance(e, LLMStreamMiddlewareRefusal):
+            # A fail-closed policy refusal is not a transport failure. Never retry
+            # it, construct a continuation, or relabel it as a reconnect opportunity.
+            self.result["error"] = e
+            return False
         _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout))
         # ReadError: abort/reset mid-body (stale-kill shutdown under a parked reader,
         # ECONNRESET) — the retry loop owns recovery.
@@ -3737,6 +3753,11 @@ class _StreamingCall(StreamingWaitMonitor):
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
             raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
         if self.result["error"] is not None:
+            from hermes_cli.middleware import LLMStreamMiddlewareRefusal
+            if isinstance(self.result["error"], LLMStreamMiddlewareRefusal):
+                # Refusal wins even after earlier accepted deltas. A partial stub
+                # would convert a fail-closed decision into continuation/recovery.
+                raise self.result["error"]
             if self.deltas_were_sent["yes"]:
                 return self._partial_stream_stub()
             raise self.result["error"]

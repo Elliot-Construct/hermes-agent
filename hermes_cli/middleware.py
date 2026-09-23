@@ -22,6 +22,20 @@ LLM_REQUEST_MIDDLEWARE = "llm_request"
 LLM_EXECUTION_MIDDLEWARE = "llm_execution"
 LLM_STREAM_TEXT_MIDDLEWARE = "llm_stream_text"
 
+class LLMStreamMiddlewareRefusal(RuntimeError):
+    """A fail-closed live-text middleware refused delivery.
+
+    Stream owners must keep this distinct from provider, transport, and display
+    failures so they do not retry, build a partial continuation, or suppress it.
+    """
+
+    def __init__(self, original: BaseException, *, callback_name: str = "") -> None:
+        self.original = original
+        self.callback_name = callback_name
+        label = f" ({callback_name})" if callback_name else ""
+        super().__init__(f"fail-closed llm_stream_text middleware refused delivery{label}: {original}")
+
+
 VALID_MIDDLEWARE: set[str] = {
     TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE,
     LLM_STREAM_TEXT_MIDDLEWARE,
@@ -161,19 +175,47 @@ def run_llm_stream_text_middleware(
     """
     from hermes_cli.plugins import _delivery_manager
 
+    import inspect
+
     manager = _delivery_manager()
     current = text
     for callback in list(manager._middleware.get(LLM_STREAM_TEXT_MIDDLEWARE, [])):
         call_kwargs = middleware_payload(text=current, kind=kind, **context)
+        failure_mode = getattr(callback, "_hermes_failure_mode", "open")
+        callback_name = getattr(callback, "__name__", repr(callback))
         try:
             result = callback(**call_kwargs)
         except Exception as exc:
             manager._report_hook_failure(
                 LLM_STREAM_TEXT_MIDDLEWARE, callback, call_kwargs, exc, surface="Middleware"
             )
-            if getattr(callback, "_hermes_failure_mode", "open") == "closed":
-                raise
+            if failure_mode == "closed":
+                raise LLMStreamMiddlewareRefusal(exc, callback_name=callback_name) from exc
             continue
+
+        if inspect.isawaitable(result):
+            # This hook is deliberately synchronous. Dispose unsupported async results
+            # instead of leaking a coroutine or silently emitting untransformed text.
+            close = getattr(result, "close", None)
+            cancel = getattr(result, "cancel", None)
+            try:
+                if callable(close):
+                    close()
+                elif callable(cancel):
+                    cancel()
+            except Exception:
+                logger.debug("Failed to dispose awaitable llm_stream_text result", exc_info=True)
+
+            exc = TypeError(
+                "llm_stream_text middleware must be synchronous; callback returned an awaitable"
+            )
+            manager._report_hook_failure(
+                LLM_STREAM_TEXT_MIDDLEWARE, callback, call_kwargs, exc, surface="Middleware"
+            )
+            if failure_mode == "closed":
+                raise LLMStreamMiddlewareRefusal(exc, callback_name=callback_name) from exc
+            continue
+
         if isinstance(result, dict) and isinstance(result.get("text"), str):
             current = result["text"]
     return current

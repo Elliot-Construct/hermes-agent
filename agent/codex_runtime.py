@@ -53,7 +53,12 @@ def _call_guarded(fn: Callable | None, fail_msg: str, *fail_args: Any, args: tup
         return
     try:
         fn(*args, **(kwargs or {}))
-    except Exception:
+    except Exception as exc:
+        from hermes_cli.middleware import LLMStreamMiddlewareRefusal
+        if isinstance(exc, LLMStreamMiddlewareRefusal):
+            # A fail-closed live-output refusal is part of the execution contract,
+            # not a best-effort display callback failure.
+            raise
         logger.debug(fail_msg, *fail_args, exc_info=True)
 
 

@@ -32,7 +32,7 @@ from hermes_constants import get_hermes_home, get_process_hermes_home, hermes_ho
 from registration_lifecycle import replacement_coordinator
 from utils import env_var_enabled
 from hermes_cli.config import load_config_readonly
-from hermes_cli.middleware import VALID_MIDDLEWARE
+from hermes_cli.middleware import LLM_STREAM_TEXT_MIDDLEWARE, VALID_MIDDLEWARE
 from hermes_cli.plugin_capabilities import plugin_capability_granted
 from hermes_cli.relay_plugin_cutover import RELAY_PLUGINS_CONFIG_ENV, legacy_relay_plugin_keys
 # Sibling modules' names are re-exported here (origin) so plugins and tests keep one import path.
@@ -929,6 +929,8 @@ class PluginContext:
         """
         if failure_mode not in {"open", "closed"}:
             raise ValueError("failure_mode must be 'open' or 'closed'")
+        if kind == LLM_STREAM_TEXT_MIDDLEWARE and inspect.iscoroutinefunction(callback):
+            raise TypeError("llm_stream_text middleware must be synchronous")
 
         @wraps(callback)
         def registered_callback(*args: Any, **kwargs: Any) -> Any:

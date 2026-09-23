@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent import chat_completion_helpers as helpers
+from agent.codex_runtime import make_codex_app_server_event_bridge
 from agent.stream_delivery import StreamDeliveryMixin
+from hermes_cli.middleware import LLMStreamMiddlewareRefusal
 
 
 class _Agent(StreamDeliveryMixin):
@@ -150,3 +153,182 @@ def test_fail_closed_transform_error_prevents_text_delivery(monkeypatch):
         agent._fire_stream_delta("must-not-display")
 
     assert delivered == []
+
+class _ManagedStream:
+    response = None
+    final_response = None
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def __iter__(self):
+        return iter(self._chunks)
+
+    def close(self):
+        return None
+
+
+def _chat_chunk(*, content=None, tool_calls=None):
+    delta = SimpleNamespace(
+        content=content,
+        reasoning_content=None,
+        reasoning=None,
+        reasoning_details=None,
+        refusal=None,
+        tool_calls=tool_calls,
+        model_extra={},
+    )
+    choice = SimpleNamespace(delta=delta, finish_reason=None)
+    return SimpleNamespace(
+        choices=[choice], model=None, id=None, provider=None, usage=None
+    )
+
+
+def _tool_delta():
+    return SimpleNamespace(
+        index=0,
+        id="call-1",
+        function=SimpleNamespace(name="read_file", arguments='{"path":"x"}'),
+        extra_content=None,
+        model_extra={},
+    )
+
+
+def _suppressed_stream_call(monkeypatch, agent, chunks):
+    call = helpers._StreamingCall.__new__(helpers._StreamingCall)
+    call.agent = agent
+    call.api_kwargs = {}
+    call.result = {"response": None, "error": None, "partial_tool_names": []}
+    call.clients = SimpleNamespace(diag=None, set_stream_handle=lambda stream: None)
+    call._stream_stale_timeout = 1.0
+    call.deltas_were_sent = {"yes": False}
+    call.first_delta_fired = {"done": False}
+    call.provider_tool_in_flight = {"yes": False}
+    call.last_chunk_time = {"t": 0.0}
+    call._stream_timeouts = lambda: (1.0, 1.0, 1.0)
+    call._new_diag = lambda: {}
+    call._set_managed_stream = lambda stream: stream
+    call._count_chunk = lambda diag, chunk: None
+    call._stream_attempt_is_active = lambda stream_attempt_id: True
+    call._stream_attempt_was_cancelled = lambda stream_attempt_id: False
+    call._close_managed_stream = lambda: None
+    call._emit_tool_started = lambda name: None
+    call._emit_reasoning = lambda text: None
+    call._finish_chat_stream = lambda *args, **kwargs: "done"
+    monkeypatch.setattr(helpers, "_relay_stream_identity", lambda *args, **kwargs: {})
+    monkeypatch.setattr(helpers, "_relay_stream_metadata", lambda *args, **kwargs: {})
+    from agent import relay_llm
+    monkeypatch.setattr(relay_llm, "stream", lambda *args, **kwargs: _ManagedStream(chunks))
+    return call
+
+
+def test_tool_delta_then_content_is_transformed_at_suppressed_sink(monkeypatch):
+    delivered = []
+    transformed = []
+
+    def transform(text, *, kind, **context):
+        transformed.append((kind, text))
+        return text.replace("secret", "SAFE")
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_stream_text_middleware",
+        transform,
+    )
+
+    agent = _Agent()
+    agent.api_mode = "chat_completions"
+    agent.base_url = ""
+    agent._interrupt_requested = False
+    agent.stream_delta_callback = delivered.append
+    call = _suppressed_stream_call(
+        monkeypatch,
+        agent,
+        [
+            _chat_chunk(tool_calls=[_tool_delta()]),
+            _chat_chunk(content="<thi"),
+            _chat_chunk(content="nk>secret</think>"),
+        ],
+    )
+
+    assert call._call_chat_completions(1) == "done"
+    assert transformed == [("text", "<thi"), ("text", "nk>secret</think>")]
+    assert delivered == ["<thi", "nk>SAFE</think>"]
+    assert agent._current_streamed_assistant_text == "<think>SAFE</think>"
+
+
+def test_tool_delta_then_content_closed_refusal_never_reaches_sink(monkeypatch):
+    delivered = []
+
+    def refuse(*args, **kwargs):
+        raise LLMStreamMiddlewareRefusal(ConnectionError("policy refused"))
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_stream_text_middleware",
+        refuse,
+    )
+
+    agent = _Agent()
+    agent.api_mode = "chat_completions"
+    agent.base_url = ""
+    agent._interrupt_requested = False
+    agent.stream_delta_callback = delivered.append
+    call = _suppressed_stream_call(
+        monkeypatch,
+        agent,
+        [_chat_chunk(tool_calls=[_tool_delta()]), _chat_chunk(content="secret")],
+    )
+
+    with pytest.raises(LLMStreamMiddlewareRefusal, match="policy refused"):
+        call._call_chat_completions(1)
+
+    assert delivered == []
+    assert agent._current_streamed_assistant_text == ""
+
+
+@pytest.mark.parametrize("already_delivered", [False, True])
+def test_stream_owner_never_converts_closed_refusal_to_partial(monkeypatch, already_delivered):
+    refusal = LLMStreamMiddlewareRefusal(ConnectionError("closed boundary"))
+    call = helpers._StreamingCall.__new__(helpers._StreamingCall)
+    call.agent = SimpleNamespace(_interrupt_requested=False)
+    call.result = {"response": None, "error": refusal}
+    call.deltas_were_sent = {"yes": already_delivered}
+    call.clients = SimpleNamespace(diag={})
+    call._resolve_stale_timeout = lambda: None
+    call._run_call = lambda: None
+    call._monitor_loop = lambda: None
+    monkeypatch.setattr(helpers, "should_use_direct_api_call", lambda agent: True)
+
+    with pytest.raises(LLMStreamMiddlewareRefusal, match="closed boundary"):
+        call.run()
+
+
+def test_stream_error_handler_never_retries_transport_shaped_refusal():
+    refusal = LLMStreamMiddlewareRefusal(ConnectionError("looks transient but is policy"))
+    call = helpers._StreamingCall.__new__(helpers._StreamingCall)
+    call.agent = SimpleNamespace()
+    call.result = {"response": None, "error": None}
+    call._request_cancelled = {"value": False}
+    call.deltas_were_sent = {"yes": True}
+
+    assert call._handle_stream_error(refusal, attempt=0, max_retries=2) is False
+    assert call.result["error"] is refusal
+
+
+def test_codex_live_interim_closed_refusal_escapes_guard(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise LLMStreamMiddlewareRefusal(RuntimeError("codex privacy refusal"))
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_stream_text_middleware",
+        refuse,
+    )
+
+    agent = _Agent()
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: None
+    bridge = make_codex_app_server_event_bridge(agent)
+
+    with pytest.raises(LLMStreamMiddlewareRefusal, match="codex privacy refusal"):
+        bridge({
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "id": "m1", "text": "secret"}},
+        })

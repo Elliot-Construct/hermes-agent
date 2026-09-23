@@ -929,7 +929,9 @@ class PluginContext:
         """
         if failure_mode not in {"open", "closed"}:
             raise ValueError("failure_mode must be 'open' or 'closed'")
-        if kind == LLM_STREAM_TEXT_MIDDLEWARE and inspect.iscoroutinefunction(callback):
+        if kind == LLM_STREAM_TEXT_MIDDLEWARE and (
+            inspect.iscoroutinefunction(callback) or inspect.isasyncgenfunction(callback)
+        ):
             raise TypeError("llm_stream_text middleware must be synchronous")
 
         @wraps(callback)

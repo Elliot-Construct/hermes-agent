@@ -13,6 +13,7 @@ from hermes_cli.middleware import (
     run_llm_stream_text_middleware,
 )
 from agent.error_classifier import classify_api_error
+from hermes_cli.plugin_validate import validate_plugin_dir
 from hermes_cli.plugins import PluginManager
 
 
@@ -290,6 +291,101 @@ def test_wrapped_awaitable_open_transform_keeps_legacy_passthrough(tmp_path, mon
         """
 async def inner():
     return {"text": "unsafe"}
+
+def transform(**kwargs):
+    return inner()
+
+ctx.register_middleware("llm_stream_text", transform, failure_mode="open")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    assert run_llm_stream_text_middleware("visible", kind="text") == "visible"
+
+
+def test_direct_async_generator_stream_registration_is_rejected(tmp_path, monkeypatch):
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "async-generator-stream",
+        """
+async def transform(**kwargs):
+    yield {"text": "unsafe"}
+
+ctx.register_middleware("llm_stream_text", transform, failure_mode="closed")
+""",
+    )
+
+    assert "must be synchronous" in (
+        manager._plugins["async-generator-stream"].error or ""
+    )
+
+
+def test_validator_rejects_async_generator_stream_registration(tmp_path):
+    plugin_dir = tmp_path / "validator-async-generator"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.yaml").write_text(
+        yaml.safe_dump({
+            "name": "validator-async-generator",
+            "version": "0.1.0",
+            "description": "validator async-generator regression",
+            "provides_middleware": ["llm_stream_text"],
+        }),
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        """
+def register(ctx):
+    async def transform(**kwargs):
+        yield {"text": "unsafe"}
+
+    ctx.register_middleware(
+        "llm_stream_text",
+        transform,
+        failure_mode="closed",
+    )
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    report = validate_plugin_dir(plugin_dir)
+
+    assert report.ok is False
+    assert any("must be synchronous" in failure for failure in report.failures)
+
+
+def test_wrapped_async_generator_closed_transform_refuses_delivery(tmp_path, monkeypatch):
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "wrapped-async-generator-closed",
+        """
+async def inner():
+    yield {"text": "unsafe"}
+
+def transform(**kwargs):
+    return inner()
+
+ctx.register_middleware("llm_stream_text", transform, failure_mode="closed")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    with pytest.raises(
+        LLMStreamMiddlewareRefusal,
+        match="asynchronous/deferred result",
+    ):
+        run_llm_stream_text_middleware("secret", kind="text")
+
+
+def test_wrapped_async_generator_open_transform_keeps_passthrough(tmp_path, monkeypatch):
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "wrapped-async-generator-open",
+        """
+async def inner():
+    yield {"text": "unsafe"}
 
 def transform(**kwargs):
     return inner()

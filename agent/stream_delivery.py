@@ -194,17 +194,19 @@ class StreamDeliveryMixin:
             return
         self._deliver_interim(visible, already_streamed=False, record=[visible])
 
-    def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
+    def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any], *, live: bool = False) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer. Does NOT set
         ``_response_was_previewed`` ("the final response was shown") — the CLI would then suppress a
         different final summary."""
         if not isinstance(assistant_msg, dict):
             return
-        commentary_parts = [
-            transformed
-            for part in self._extract_codex_interim_visible_parts(assistant_msg)
-            if (transformed := self._transform_live_text(part, kind="interim"))
-        ]
+        commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
+        if live:
+            commentary_parts = [
+                transformed
+                for part in commentary_parts
+                if (transformed := self._transform_live_text(part, kind="interim"))
+            ]
         # Dedup within this message and against earlier deliveries, first occurrence wins.
         pending: dict[str, str] = {}
         for part in commentary_parts:
@@ -216,7 +218,8 @@ class StreamDeliveryMixin:
             visible = "\n\n".join(undelivered_parts).strip()
         else:
             visible = self._interim_assistant_visible_text(assistant_msg)
-            visible = self._transform_live_text(visible, kind="interim") if visible else visible
+            if live and visible:
+                visible = self._transform_live_text(visible, kind="interim")
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
             return
         already_streamed = self._interim_content_was_streamed(visible)

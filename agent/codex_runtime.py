@@ -973,7 +973,10 @@ def _consume_codex_event_stream(
                 on_event(event)
             except (TimeoutError, InterruptedError):
                 raise  # watchdog / cancellation control flow must propagate
-            except Exception:
+            except Exception as exc:
+                from hermes_cli.middleware import LLMStreamMiddlewareRefusal
+                if isinstance(exc, LLMStreamMiddlewareRefusal):
+                    raise
                 logger.debug("Codex stream on_event hook raised", exc_info=True)
         if (interrupt_check is not None and interrupt_check()) or assembler.feed(event):
             break

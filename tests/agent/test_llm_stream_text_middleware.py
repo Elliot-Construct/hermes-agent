@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent import chat_completion_helpers as helpers
-from agent.codex_runtime import make_codex_app_server_event_bridge
+from agent.codex_runtime import _consume_codex_event_stream, make_codex_app_server_event_bridge
+from agent.transports.codex_app_server_session import CodexAppServerSession
 from agent.stream_delivery import StreamDeliveryMixin
 from hermes_cli.middleware import LLMStreamMiddlewareRefusal
 
@@ -332,3 +333,25 @@ def test_codex_live_interim_closed_refusal_escapes_guard(monkeypatch):
             "method": "item/completed",
             "params": {"item": {"type": "agentMessage", "id": "m1", "text": "secret"}},
         })
+
+def test_codex_app_server_transport_does_not_swallow_closed_refusal():
+    refusal = LLMStreamMiddlewareRefusal(RuntimeError("session privacy refusal"))
+    session = CodexAppServerSession.__new__(CodexAppServerSession)
+
+    def on_event(note):
+        raise refusal
+
+    session._on_event = on_event
+
+    with pytest.raises(LLMStreamMiddlewareRefusal, match="session privacy refusal"):
+        session._absorb_notification(SimpleNamespace(), None, {"method": "item/completed"})
+
+
+def test_codex_responses_event_owner_does_not_swallow_closed_refusal():
+    refusal = LLMStreamMiddlewareRefusal(RuntimeError("responses privacy refusal"))
+
+    def on_event(event):
+        raise refusal
+
+    with pytest.raises(LLMStreamMiddlewareRefusal, match="responses privacy refusal"):
+        _consume_codex_event_stream([{}], model="test-model", on_event=on_event)

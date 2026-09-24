@@ -3466,7 +3466,13 @@ class _StreamingCall(StreamingWaitMonitor):
                 logger.warning(
                     "Stream died after deltas but before any visible text was delivered (0 chars, "
                     "no tool call in flight); treating as an undelivered stream failure: %s", e)
-                self._quiet(self.agent._reset_stream_delivery_tracking)
+                try:
+                    self.agent._reset_stream_delivery_tracking()
+                except LLMStreamMiddlewareRefusal as _ref:
+                    self.result["error"] = _ref
+                    return False
+                except Exception:
+                    pass  # best-effort display cleanup
                 self.deltas_were_sent["yes"] = False
                 self.first_delta_fired["done"] = False
         if self.deltas_were_sent["yes"]:
@@ -3481,8 +3487,20 @@ class _StreamingCall(StreamingWaitMonitor):
             # Marker explains the re-streamed preamble (``_emit_stream_drop`` logs the WARNING);
             # reset the streamed-text buffer so it isn't double-recorded; fresh accumulators.
             if self.agent._warning_presentation_enabled():
-                self._quiet(self.agent._fire_stream_delta, "\n\n⚠ Connection dropped mid tool-call; reconnecting…\n\n")
-            self._quiet(self.agent._reset_stream_delivery_tracking)
+                try:
+                    self.agent._fire_stream_delta("\n\n⚠ Connection dropped mid tool-call; reconnecting…\n\n")
+                except LLMStreamMiddlewareRefusal as _ref:
+                    self.result["error"] = _ref
+                    return False
+                except Exception:
+                    pass
+            try:
+                self.agent._reset_stream_delivery_tracking()
+            except LLMStreamMiddlewareRefusal as _ref:
+                self.result["error"] = _ref
+                return False
+            except Exception:
+                pass
             self.deltas_were_sent["yes"] = False
             self.first_delta_fired["done"] = False
             self._retry_after_drop(e, attempt, max_retries, mid_tool_call=True, reason="stream_mid_tool_retry_cleanup")

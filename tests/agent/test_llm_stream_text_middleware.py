@@ -114,6 +114,53 @@ def test_interim_is_transformed_before_interim_callback(monkeypatch):
     assert delivered == [("interim:token", False)]
 
 
+def test_live_interim_suppression_does_not_resurrect_structured_commentary(monkeypatch):
+    transformed = []
+    delivered = []
+
+    def transform(text, *, kind, **context):
+        transformed.append((kind, text))
+        if text in {"secret-a", "secret-b"}:
+            return ""
+        return text
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_stream_text_middleware",
+        transform,
+    )
+
+    agent = _Agent()
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: delivered.append(
+            (text, already_streamed)
+        )
+    )
+    agent._emit_interim_assistant_message(
+        {
+            "content": "top-level fallback must not be used",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "secret-a"}],
+                },
+                {
+                    "type": "message",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "secret-b"}],
+                },
+            ],
+        },
+        live=True,
+    )
+
+    assert transformed == [
+        ("interim", "secret-a"),
+        ("interim", "secret-b"),
+    ]
+    assert delivered == []
+
+
 def test_post_response_interim_skips_live_transform(monkeypatch):
     delivered = []
 

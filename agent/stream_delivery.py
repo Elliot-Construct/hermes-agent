@@ -201,6 +201,7 @@ class StreamDeliveryMixin:
         if not isinstance(assistant_msg, dict):
             return
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
+        had_structured_commentary = bool(commentary_parts)
         if live:
             commentary_parts = [
                 transformed
@@ -214,7 +215,7 @@ class StreamDeliveryMixin:
             if key and key not in pending and not self._interim_text_was_delivered(part):
                 pending[key] = part
         undelivered_parts = list(pending.values())
-        if commentary_parts:
+        if had_structured_commentary:
             visible = "\n\n".join(undelivered_parts).strip()
         else:
             visible = self._interim_assistant_visible_text(assistant_msg)

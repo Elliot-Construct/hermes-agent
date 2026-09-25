@@ -226,8 +226,23 @@ def run_llm_stream_text_middleware(
                 raise LLMStreamMiddlewareRefusal(exc, callback_name=callback_name) from exc
             continue
 
-        if isinstance(result, dict) and isinstance(result.get("text"), str):
+        if result is None:
+            # None = intentional no-change sentinel; keep current text.
+            pass
+        elif isinstance(result, dict) and isinstance(result.get("text"), str):
             current = result["text"]
+        else:
+            # Any other synchronous result shape is a contract violation.
+            exc = TypeError(
+                f"llm_stream_text middleware {callback_name} returned an invalid result "
+                f"type {type(result).__name__!r}; expected {{\"text\": <str>}} or None"
+            )
+            manager._report_hook_failure(
+                LLM_STREAM_TEXT_MIDDLEWARE, callback, call_kwargs, exc, surface="Middleware"
+            )
+            if failure_mode == "closed":
+                raise LLMStreamMiddlewareRefusal(exc, callback_name=callback_name) from exc
+            # fail-open: preserve current text, skip malformed callback
     return current
 
 

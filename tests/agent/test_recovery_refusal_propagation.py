@@ -196,3 +196,34 @@ def test_initial_refusal_still_terminates():
 
     assert result is False
     assert isinstance(sc.result["error"], LLMStreamMiddlewareRefusal)
+
+
+# ── Partial-stub warning refusal ──────────────────────────────────
+
+def test_partial_stream_stub_warning_refusal_propagates():
+    """_partial_stream_stub() must not swallow LLMStreamMiddlewareRefusal
+    raised during warning delivery. The refusal must propagate to run()."""
+    agent = _FakeAgent()
+    agent._fire_delta_raises = LLMStreamMiddlewareRefusal
+    agent._warning_presentation_enabled = lambda: True
+    sc = _make_streaming_call(agent)
+    sc.result["partial_tool_names"] = ["some_tool"]
+    sc.result["error"] = ConnectionError("original stream error")
+
+    with pytest.raises(LLMStreamMiddlewareRefusal):
+        sc._partial_stream_stub()
+
+
+def test_partial_stream_stub_ordinary_display_exception_is_benign():
+    """Ordinary display exceptions in partial-stub warning remain best-effort."""
+    agent = _FakeAgent()
+    agent._warning_presentation_enabled = lambda: True
+    # Make _fire_stream_delta raise a regular exception
+    agent._fire_stream_delta = MagicMock(side_effect=RuntimeError("display broken"))
+    sc = _make_streaming_call(agent)
+    sc.result["partial_tool_names"] = ["some_tool"]
+    sc.result["error"] = ConnectionError("original stream error")
+
+    # Should NOT raise — ordinary display failures are best-effort
+    stub = sc._partial_stream_stub()
+    assert stub is not None

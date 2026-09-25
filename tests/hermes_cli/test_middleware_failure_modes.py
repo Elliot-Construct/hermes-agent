@@ -427,3 +427,59 @@ def test_stream_refusal_classification_is_non_retryable_and_non_fallback():
     assert classified.should_rotate_credential is False
     assert classified.should_fallback is False
     assert classified.error_context["middleware"] == "llm_stream_text"
+
+
+def test_malformed_sync_result_closed_refuses(tmp_path, monkeypatch):
+    """A closed transform returning a malformed result (not dict/None) raises refusal."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "malformed-closed",
+        """
+def bad_transform(**kwargs):
+    return {"txt": "SAFE"}
+
+ctx.register_middleware("llm_stream_text", bad_transform, failure_mode="closed")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    with pytest.raises(LLMStreamMiddlewareRefusal):
+        run_llm_stream_text_middleware("secret", kind="text")
+
+
+def test_malformed_sync_result_open_preserves(tmp_path, monkeypatch):
+    """An open transform returning a malformed result preserves current text."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "malformed-open",
+        """
+def bad_transform(**kwargs):
+    return False
+
+ctx.register_middleware("llm_stream_text", bad_transform, failure_mode="open")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    assert run_llm_stream_text_middleware("visible", kind="text") == "visible"
+
+
+def test_malformed_sync_result_non_dict_closed_refuses(tmp_path, monkeypatch):
+    """A closed transform returning a raw string raises refusal."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "malformed-str-closed",
+        """
+def bad_transform(**kwargs):
+    return "SAFE"
+
+ctx.register_middleware("llm_stream_text", bad_transform, failure_mode="closed")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    with pytest.raises(LLMStreamMiddlewareRefusal):
+        run_llm_stream_text_middleware("secret", kind="text")

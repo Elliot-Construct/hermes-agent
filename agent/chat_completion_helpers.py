@@ -3706,7 +3706,13 @@ class _StreamingCall(StreamingWaitMonitor):
                      f"Ask me to retry if you want to continue.")
             _partial_text = (_partial_text or "") + _warn  # model/result bookkeeping, never gated
             if self.agent._warning_presentation_enabled():
-                self._quiet(self.agent._fire_stream_delta, _warn)  # visible immediately
+                from hermes_cli.middleware import LLMStreamMiddlewareRefusal
+                try:
+                    self.agent._fire_stream_delta(_warn)
+                except LLMStreamMiddlewareRefusal:
+                    raise  # policy refusal must not be swallowed by partial-stub construction
+                except Exception:
+                    pass  # best-effort display
             logger.warning(
                 "Partial stream dropped tool call(s) %s after %s chars of text; surfaced warning to user: %s",
                 _partial_names, len(_partial_text or ""), error)

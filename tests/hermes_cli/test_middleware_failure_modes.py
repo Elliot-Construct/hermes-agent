@@ -10,6 +10,7 @@ import yaml
 from hermes_cli.middleware import (
     LLMStreamMiddlewareRefusal,
     run_llm_execution_middleware,
+    run_llm_final_output_commit_middleware,
     run_llm_stream_text_middleware,
 )
 from agent.error_classifier import classify_api_error
@@ -483,3 +484,238 @@ ctx.register_middleware("llm_stream_text", bad_transform, failure_mode="closed")
 
     with pytest.raises(LLMStreamMiddlewareRefusal):
         run_llm_stream_text_middleware("secret", kind="text")
+
+
+_COMMIT_CONTEXT = {
+    "session_id": "session-1",
+    "turn_id": "turn-1",
+    "api_request_id": "request-1",
+    "provider": "openrouter",
+    "model": "test/model",
+}
+
+
+def test_final_output_commit_allow_baseline(tmp_path, monkeypatch):
+    """A registered gate returning 'allow' lets the commit proceed."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "commit-allow",
+        """
+def gate(**kwargs):
+    return "allow"
+
+ctx.register_middleware("llm_final_output_commit", gate, failure_mode="closed")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    result = run_llm_final_output_commit_middleware(
+        {"text": "candidate"}, _COMMIT_CONTEXT
+    )
+
+    assert result == "allow"
+
+
+def test_final_output_commit_explicit_drop(tmp_path, monkeypatch):
+    """A gate returning 'drop' refuses the final-output commit."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "commit-drop",
+        """
+def gate(**kwargs):
+    return "drop"
+
+ctx.register_middleware("llm_final_output_commit", gate, failure_mode="closed")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    result = run_llm_final_output_commit_middleware(
+        {"text": "candidate"}, _COMMIT_CONTEXT
+    )
+
+    assert result == "drop"
+
+
+def test_final_output_commit_fail_closed_exception(tmp_path, monkeypatch):
+    """A raising gate under failure_mode='closed' raises LLMStreamMiddlewareRefusal."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "commit-fail-closed",
+        """
+def gate(**kwargs):
+    raise RuntimeError("commit gate unavailable")
+
+ctx.register_middleware("llm_final_output_commit", gate, failure_mode="closed")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    with pytest.raises(LLMStreamMiddlewareRefusal, match="commit gate unavailable"):
+        run_llm_final_output_commit_middleware(
+            {"text": "candidate"}, _COMMIT_CONTEXT
+        )
+
+
+def test_final_output_commit_fail_open_exception(tmp_path, monkeypatch):
+    """A raising gate under failure_mode='open' is skipped; commit stays allowed."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "commit-fail-open",
+        """
+def gate(**kwargs):
+    raise RuntimeError("commit gate unavailable")
+
+ctx.register_middleware("llm_final_output_commit", gate, failure_mode="open")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    result = run_llm_final_output_commit_middleware(
+        {"text": "candidate"}, _COMMIT_CONTEXT
+    )
+
+    assert result == "allow"
+
+
+def test_final_output_commit_multiple_gates_drop_wins(tmp_path, monkeypatch):
+    """gate1 'allow' followed by gate2 'drop' → commit result is 'drop'."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "commit-multi-drop",
+        """
+def gate1(**kwargs):
+    return "allow"
+
+def gate2(**kwargs):
+    return "drop"
+
+ctx.register_middleware("llm_final_output_commit", gate1, failure_mode="closed")
+ctx.register_middleware("llm_final_output_commit", gate2, failure_mode="closed")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    result = run_llm_final_output_commit_middleware(
+        {"text": "candidate"}, _COMMIT_CONTEXT
+    )
+
+    assert result == "drop"
+
+
+def test_final_output_commit_multiple_gates_allow(tmp_path, monkeypatch):
+    """gate1 and gate2 both 'allow' → commit result is 'allow'."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "commit-multi-allow",
+        """
+def gate1(**kwargs):
+    return "allow"
+
+def gate2(**kwargs):
+    return "allow"
+
+ctx.register_middleware("llm_final_output_commit", gate1, failure_mode="closed")
+ctx.register_middleware("llm_final_output_commit", gate2, failure_mode="closed")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    result = run_llm_final_output_commit_middleware(
+        {"text": "candidate"}, _COMMIT_CONTEXT
+    )
+
+    assert result == "allow"
+
+
+def test_final_output_commit_no_registration(tmp_path, monkeypatch):
+    """No llm_final_output_commit registration → 'allow' (backward compatible)."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "commit-none",
+        """
+def unrelated(**kwargs):
+    return None
+
+ctx.register_middleware("llm_execution", unrelated, failure_mode="open")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    result = run_llm_final_output_commit_middleware(
+        {"text": "candidate"}, _COMMIT_CONTEXT
+    )
+
+    assert result == "allow"
+
+
+def test_final_output_commit_none_return_is_allow(tmp_path, monkeypatch):
+    """A gate returning None is a no-op verdict; commit stays allowed."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "commit-none-return",
+        """
+def gate(**kwargs):
+    return None
+
+ctx.register_middleware("llm_final_output_commit", gate, failure_mode="closed")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    result = run_llm_final_output_commit_middleware(
+        {"text": "candidate"}, _COMMIT_CONTEXT
+    )
+
+    assert result == "allow"
+
+
+def test_final_output_commit_malformed_closed_refuses(tmp_path, monkeypatch):
+    """A gate returning an invalid type (42) under failure_mode='closed' refuses."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "commit-malformed-closed",
+        """
+def gate(**kwargs):
+    return 42
+
+ctx.register_middleware("llm_final_output_commit", gate, failure_mode="closed")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    with pytest.raises(LLMStreamMiddlewareRefusal):
+        run_llm_final_output_commit_middleware(
+            {"text": "candidate"}, _COMMIT_CONTEXT
+        )
+
+
+def test_final_output_commit_malformed_open_skips(tmp_path, monkeypatch):
+    """A gate returning an invalid type under failure_mode='open' is skipped."""
+    manager = _load_plugin(
+        tmp_path,
+        monkeypatch,
+        "commit-malformed-open",
+        """
+def gate(**kwargs):
+    return 42
+
+ctx.register_middleware("llm_final_output_commit", gate, failure_mode="open")
+""",
+    )
+    _use_manager(monkeypatch, manager)
+
+    result = run_llm_final_output_commit_middleware(
+        {"text": "candidate"}, _COMMIT_CONTEXT
+    )
+
+    assert result == "allow"

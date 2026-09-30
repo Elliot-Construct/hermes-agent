@@ -21,6 +21,7 @@ TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
 LLM_REQUEST_MIDDLEWARE = "llm_request"
 LLM_EXECUTION_MIDDLEWARE = "llm_execution"
 LLM_STREAM_TEXT_MIDDLEWARE = "llm_stream_text"
+LLM_FINAL_OUTPUT_COMMIT_MIDDLEWARE = "llm_final_output_commit"
 
 class LLMStreamMiddlewareRefusal(RuntimeError):
     """A fail-closed live-text middleware refused delivery.
@@ -38,7 +39,7 @@ class LLMStreamMiddlewareRefusal(RuntimeError):
 
 VALID_MIDDLEWARE: set[str] = {
     TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE,
-    LLM_STREAM_TEXT_MIDDLEWARE,
+    LLM_STREAM_TEXT_MIDDLEWARE, LLM_FINAL_OUTPUT_COMMIT_MIDDLEWARE,
 }
 
 
@@ -244,6 +245,96 @@ def run_llm_stream_text_middleware(
                 raise LLMStreamMiddlewareRefusal(exc, callback_name=callback_name) from exc
             # fail-open: preserve current text, skip malformed callback
     return current
+
+
+def run_llm_final_output_commit_middleware(
+    candidate: Dict[str, Any], context: Dict[str, Any] | None = None,
+) -> str:
+    """Gate final-output commit through registered ``llm_final_output_commit`` middleware.
+
+    Each callback receives ``candidate`` plus context and may return ``"allow"``,
+    ``"drop"``, or ``None`` (None = allow for that gate). Verdicts are matched
+    case-insensitively. Any explicit ``"drop"`` terminates the chain immediately.
+    A fail-closed callback exception or invalid return raises
+    :class:`LLMStreamMiddlewareRefusal`; fail-open ones are skipped. Only full-chain
+    completion without ``"drop"`` yields ``"allow"``.
+    """
+    from hermes_cli.plugins import _delivery_manager
+
+    import inspect
+
+    manager = _delivery_manager()
+    context = context or {}
+    for callback in list(manager._middleware.get(LLM_FINAL_OUTPUT_COMMIT_MIDDLEWARE, [])):
+        call_kwargs = middleware_payload(candidate=candidate, **context)
+        failure_mode = getattr(callback, "_hermes_failure_mode", "open")
+        callback_name = getattr(callback, "__name__", repr(callback))
+        try:
+            result = callback(**call_kwargs)
+        except Exception as exc:
+            manager._report_hook_failure(
+                LLM_FINAL_OUTPUT_COMMIT_MIDDLEWARE, callback, call_kwargs, exc, surface="Middleware"
+            )
+            if failure_mode == "closed":
+                raise LLMStreamMiddlewareRefusal(exc, callback_name=callback_name) from exc
+            continue
+
+        async_result = (
+            inspect.isawaitable(result)
+            or inspect.isasyncgen(result)
+            or callable(getattr(result, "__aiter__", None))
+        )
+        if async_result:
+            # This hook is deliberately synchronous. Dispose awaitables where doing
+            # so is itself synchronous; async generators/iterables are never driven.
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                cancel = getattr(result, "cancel", None)
+                try:
+                    if callable(close):
+                        close()
+                    elif callable(cancel):
+                        cancel()
+                except Exception:
+                    logger.debug(
+                        "Failed to dispose deferred llm_final_output_commit result",
+                        exc_info=True,
+                    )
+
+            exc = TypeError(
+                "llm_final_output_commit middleware must be synchronous; "
+                "callback returned an asynchronous/deferred result"
+            )
+            manager._report_hook_failure(
+                LLM_FINAL_OUTPUT_COMMIT_MIDDLEWARE, callback, call_kwargs, exc, surface="Middleware"
+            )
+            if failure_mode == "closed":
+                raise LLMStreamMiddlewareRefusal(exc, callback_name=callback_name) from exc
+            continue
+
+        if result is None:
+            # None = allow for this gate; continue the chain.
+            continue
+        if isinstance(result, str):
+            verdict = result.strip().lower()
+            if verdict == "allow":
+                continue
+            if verdict == "drop":
+                return "drop"
+        # Any other return value (wrong type, or a string that is not allow/drop)
+        # is a contract violation.
+        exc = TypeError(
+            f"llm_final_output_commit middleware {callback_name} returned an invalid "
+            f"result {result!r} of type {type(result).__name__!r}; "
+            f"expected 'allow', 'drop', or None"
+        )
+        manager._report_hook_failure(
+            LLM_FINAL_OUTPUT_COMMIT_MIDDLEWARE, callback, call_kwargs, exc, surface="Middleware"
+        )
+        if failure_mode == "closed":
+            raise LLMStreamMiddlewareRefusal(exc, callback_name=callback_name) from exc
+        # fail-open: skip malformed gate and continue the chain.
+    return "allow"
 
 
 class _DownstreamExecutionError(Exception):

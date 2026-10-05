@@ -304,14 +304,18 @@ class StreamDeliveryMixin:
             )
 
     def _stream_hook_base_payload(self) -> Dict[str, Any]:
+        # Identity fields are optional here: the synchronous live-text transform calls this
+        # on the delivery path for any agent object, including construction-incomplete and
+        # ``object.__new__`` test doubles that never ran ``__init__``. The first three keys
+        # already tolerated that; the rest must too.
         return {
             "turn_id": getattr(self, "_current_turn_id", "") or "",
             "api_request_id": getattr(self, "_current_api_request_id", "") or "",
             "iteration": int(getattr(self, "_api_call_count", 0) or 0),
-            "session_id": self.session_id or "",
-            "model": self.model or "",
-            "provider": self.provider or "",
-            "surface": self.platform or "cli",
+            "session_id": getattr(self, "session_id", None) or "",
+            "model": getattr(self, "model", None) or "",
+            "provider": getattr(self, "provider", None) or "",
+            "surface": getattr(self, "platform", None) or "cli",
         }
 
     def _emit_stream_start(self) -> None:

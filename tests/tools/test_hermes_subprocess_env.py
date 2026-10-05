@@ -123,6 +123,13 @@ class TestTierInvariants:
     def test_tier1_covers_infra_secrets(self):
         assert {"MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY"} <= _ALWAYS_STRIP_KEYS
 
+    def test_tier1_covers_orch_token(self):
+        """INFRA-31: a spawn-inherited ORCH_TOKEN must never reach a child
+        gateway — that pollution made every profile's leases authenticate as
+        agent:ArthurSinclair. Per-principal tokens come from profile .env /
+        the secret scope at request time instead."""
+        assert "ORCH_TOKEN" in _ALWAYS_STRIP_KEYS
+
     def test_tier1_covers_dashboard_auth(self):
         # Credentialed CLIs (claude/codex) must not be able to mint dashboard sessions.
         assert {"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "HERMES_DASHBOARD_BASIC_AUTH_SECRET",

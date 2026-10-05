@@ -382,5 +382,12 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "HERMES_DASHBOARD_DRAIN_SECRET",
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY",
+    # Browser-orchestrator bearer token (INFRA-31): spawn-time env inheritance
+    # carried a shell-exported ORCH_TOKEN into the gateway, so every profile's
+    # leases authenticated as agent:ArthurSinclair. Per-principal tokens are
+    # read from profile .env / secret scope at request time — no child needs
+    # the launch env's copy, and a profile gateway's OWN .env value is
+    # re-added by served_profile_child_env's scope overlay after this scrub.
+    "ORCH_TOKEN",
 }) | _ADAPTER_SECRET_ENV  # every declared adapter secret is Tier 1, like the bot tokens above
 _ALWAYS_STRIP_FOLDED: frozenset[str] = frozenset(k.upper() for k in _ALWAYS_STRIP_KEYS)

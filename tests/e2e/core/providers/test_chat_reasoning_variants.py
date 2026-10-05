@@ -24,26 +24,15 @@ import pytest
 from tests.e2e.core.providers._openai_helpers import (
     READ_TOOL,
     Home,
-    bug_assertions,
     chat_messages,
     custom_chat_config,
     db_messages,
-    known_marks,
     oneshot,
 )
 from tests.e2e.core.providers._openai_tui import TuiGateway
 from tests.fakes.providers.chat_variants import CText, CTools, FakeChatVariantServer
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="subprocess harness is Linux-gated")
-
-KNOWN: dict[str, str] = {
-    "reasoning_budget_session_keeps_answering":
-        "#118182 replayed reasoning_details grow past a route budget and wedge the session on a 400",
-}
-
-
-def known(name: str) -> list:
-    return known_marks(KNOWN, name)
 
 
 def _rd(tag: str, text: str | None = None) -> list[dict]:
@@ -128,10 +117,11 @@ def test_reasoning_content_echoed_on_tool_call_messages(tmp_path) -> None:
     assert _assistant_field(mains[2], "reasoning_content") == ["ds-1", "ds-2"], chat_messages(mains[2], "assistant")
 
 
-@pytest.mark.parametrize("scenario", [pytest.param("budget", marks=known("reasoning_budget_session_keeps_answering"))])
-def test_long_session_does_not_wedge_on_replayed_reasoning_budget(tmp_path, scenario) -> None:
+def test_long_session_does_not_wedge_on_replayed_reasoning_budget(tmp_path) -> None:
     """Each turn mints ~1 KB of reasoning; the route 400s ("Provider returned error", not
-    retryable) once the replayed total passes 4 KB. Every turn must still be answered."""
+    retryable) once the replayed total passes 4 KB. The Portal never sees replayed
+    reasoning_details on the wire (#118182), so every turn is answered and the budget is
+    never crossed, while state.db keeps the blocks for a later switch to a replaying route."""
     turns = 8
     script = [CText(f"ANSWER-{i}", reasoning_details=_rd(str(i), "r" * 1000)) for i in range(turns)]
     h = Home(tmp_path)
@@ -140,7 +130,8 @@ def test_long_session_does_not_wedge_on_replayed_reasoning_budget(tmp_path, scen
         h.write(_impersonated_config("inference-api.nousresearch.com"), dotenv={"OPENAI_API_KEY": "sk-fake"})
         gw = TuiGateway(h, _proxy_env(srv))
         try:
-            sid = gw.call("session.create", {"cols": 120})["session_id"]
+            created = gw.call("session.create", {"cols": 120})
+            sid, stored_id = created["session_id"], created["stored_session_id"]
             for i in range(turns):
                 answers.append(gw.turn(sid, f"question {i}"))
         finally:
@@ -148,7 +139,13 @@ def test_long_session_does_not_wedge_on_replayed_reasoning_budget(tmp_path, scen
         records = srv.main_records()
     assert records and {r["host"] for r in records} == {"inference-api.nousresearch.com"}, "precondition: impersonated"
     rejected = [i for i, r in enumerate(records) if r.get("response") == "route_rejection"]
-    assert rejected, "precondition: the replayed total crossed the route budget at least once"
+    assert rejected == [], f"route budget crossed at requests {rejected}: replayed reasoning_details reached the wire"
+    leaked = [(i, m) for i, r in enumerate(records) for m in chat_messages(r["body"], "assistant")
+              if "reasoning_details" in m]
+    assert leaked == [], f"reasoning_details sent to the Portal wire: {leaked}"
     missing = [i for i in range(turns) if f"ANSWER-{i}" not in answers[i]]
-    with bug_assertions():
-        assert not missing, f"turns {missing} were not answered once replayed reasoning passed the budget: {answers}"
+    assert not missing, f"turns {missing} were not answered: {answers}"
+    # Rows persist under the STORED session key (the runtime id only routes RPCs).
+    stored = [json.loads(r["reasoning_details"]) for r in db_messages(h, stored_id)
+              if r["role"] == "assistant" and r["reasoning_details"]]
+    assert stored == [_rd(str(i), "r" * 1000) for i in range(turns)], "state.db must keep the blocks for a switch back"

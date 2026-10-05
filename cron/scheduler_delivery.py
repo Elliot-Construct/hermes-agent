@@ -1360,10 +1360,11 @@ def _resolve_target_transport(
     from gateway.delivery import DeliveryTransport, resolve_delivery_transport
     target_adapters = adapters
     transport = None
-    if isinstance(adapters, _preflight.SharedRouteAdapters):
+    if isinstance(adapters, _preflight.SharedRouteAdapters) and not adapters.owns(platform):
         # Credentialless satellite: the primary adapter serves THIS target only when an exact
         # primary route maps it to this profile; a miss fails closed below.
-        # See #101113.
+        # See #101113. A platform the profile runs ITSELF (owns()) skips this shared grant and
+        # takes the native branch below, so its own ``enabled:``/credential still veto.
         shared = adapters.get(platform, target)
         target_adapters = {platform: shared} if shared is not None else {}
         if shared is not None:

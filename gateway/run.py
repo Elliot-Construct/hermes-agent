@@ -4809,10 +4809,24 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
         if profile_adapters is None:
             continue
         with _profile_runtime_scope(profile_home or get_hermes_home()):
-            if profile_name is not None and not profile_adapters and adapters:
+            if (
+                profile_name is not None
+                and adapters
+                and not isinstance(profile_adapters, sched_preflight.SharedRouteAdapters)
+            ):
                 routes = sched_preflight._primary_profile_routes_for_current_home()
                 if routes:
-                    profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
+                    # Hybrid view (same grant as tick_adapters_for): the profile's own platforms
+                    # keep their own adapters, the rest ride routed primary adapters. An own map
+                    # must not shadow the primary, else routed delivery fails as
+                    # "platform 'X' not configured/enabled". A credentialless satellite (no own
+                    # platforms) keeps the plain two-argument route-only view it always had.
+                    if profile_adapters:
+                        profile_adapters = sched_preflight.SharedRouteAdapters(
+                            adapters, routes, own=profile_adapters,
+                        )
+                    else:
+                        profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
             cron_scheduler.drain_delivery_queue(profile_adapters, loop)
 
 

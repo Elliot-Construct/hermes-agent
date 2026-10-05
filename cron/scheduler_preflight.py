@@ -201,14 +201,32 @@ class SharedRouteAdapters:
     See #101113.
     """
 
-    def __init__(self, primary_adapters, routes) -> None:
+    def __init__(self, primary_adapters, routes, own=None) -> None:
         self._primary = dict(primary_adapters or {})
         self._routes = list(routes or [])
+        # Hybrid view (#101113 follow-up): platforms the profile runs ITSELF keep their own
+        # adapter; everything else is route-gated to the primary. Without this a non-empty own
+        # map used to shadow the primary entirely, so a satellite that runs e.g. a2a/webhook
+        # could never deliver to a routed platform ("platform 'X' not configured/enabled").
+        self._own = dict(own or {})
 
     def __bool__(self) -> bool:
         return bool(self._primary) and bool(self._routes)
 
+    def owns(self, platform) -> bool:
+        """True when the profile runs ``platform`` natively (its own credential/adapter) —
+        callers must then take the NATIVE branch so the profile's own ``enabled:`` veto holds."""
+        return platform in self._own
+
+    def own_adapters(self) -> dict:
+        return dict(self._own)
+
     def get(self, platform, target=None, default=None):
+        # An own platform resolves without a target: it is the profile's own adapter, so no
+        # route authorisation is involved (and none may re-point it).
+        own_adapter = self._own.get(platform)
+        if own_adapter is not None:
+            return own_adapter
         if not target:
             return default
         adapter = self._primary.get(platform)

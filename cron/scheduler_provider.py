@@ -559,9 +559,16 @@ class InProcessCronScheduler(CronScheduler):
             # Deliver via the profile's OWN adapters; NEVER fall back to the default profile's
             # (wrong bot). A credentialless satellite may ride the PRIMARY adapter only for targets
             # an exact enabled route maps here; else fail closed (delivery skipped this tick).
+            # A profile that runs ANY platform itself gets the HYBRID view: its own platforms keep
+            # native semantics, everything else is route-gated — its own map must not shadow the
+            # primary (else 'platform telegram not configured/enabled' for every routed target).
             if profile_name is None or profile_name == default_profile:
                 return adapters
             tick_adapters = (profile_adapters or {}).get(profile_name) or {}
+            if tick_adapters and adapters:
+                return SharedRouteAdapters(
+                    adapters, _primary_profile_routes_for_current_home(), own=tick_adapters,
+                )
             if not tick_adapters and adapters:
                 return SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
             return tick_adapters

@@ -2361,8 +2361,46 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
 _SUMMARY_ATTEMPT_BUILDERS = {"codex_responses": _codex_summary_attempt, "anthropic_messages": _anthropic_summary_attempt}
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
-    """Request a summary when max iterations are reached. Returns the final response text."""
+def _gate_iteration_summary(agent, text: str, summary_api_request_id: str) -> str:
+    """``llm_final_output_commit`` for the iteration-budget summary, evaluated BEFORE its
+    first assistant-row append.
+
+    Returns ``"allow"``, ``"drop"`` or ``"refused"``. A fail-closed refusal is recorded as
+    terminal by :func:`gate_final_output` and then handled here rather than re-raised:
+    this producer runs inside ``finalize_turn``'s budget fallback, past every loop error
+    owner, so settling in place (no append, no candidate) is the terminal outcome.
+    """
+    from agent.turn_final_output import gate_final_output
+    from hermes_cli.middleware import LLMStreamMiddlewareRefusal
+
+    turn_id = getattr(agent, "_current_turn_id", "") or ""
+    try:
+        return gate_final_output(
+            agent,
+            candidate={
+                "content": text,
+                "role": "assistant",
+                "tool_calls": [],
+                "finish_reason": "stop",
+            },
+            context={
+                "session_id": getattr(agent, "session_id", ""),
+                "turn_id": turn_id,
+                "api_request_id": summary_api_request_id,
+                "provider": getattr(agent, "provider", ""),
+                "model": getattr(agent, "model", ""),
+            },
+            turn_id=turn_id,
+        )
+    except LLMStreamMiddlewareRefusal as refusal:
+        logger.warning("llm_final_output_commit refused the iteration summary: %s", refusal)
+        return "refused"
+
+
+def handle_max_iterations(agent, messages: list, api_call_count: int) -> Optional[str]:
+    """Request a summary when max iterations are reached. Returns the final response text,
+    or ``None`` when the final-output gate dropped or refused the summary (nothing is
+    appended in that case)."""
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (-Q, oneshot): keep diagnostics off stdout. quiet_mode is
@@ -2396,8 +2434,21 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
             if text:
                 summary_call_outcome = "success"
-                append_message(messages, {"role": "assistant", "content": text})
-                final_response = text
+                # llm_final_output_commit: the decision must land BEFORE this first
+                # assistant-row append. Once appended, _drop_transcript_scaffolding()
+                # keeps the row and _persist_session() writes it as durable, replayable
+                # state even when a later gate DROP clears final_response — so gate here,
+                # and append only on allow (PR 120170 re-review at 0e25ab97f7, P1 #1).
+                if _gate_iteration_summary(agent, text, summary_api_request_id) == "allow":
+                    append_message(messages, {"role": "assistant", "content": text})
+                    final_response = text
+                else:
+                    # Terminal (DROP or fail-closed refusal): nothing was appended and no
+                    # candidate is returned; pop the unanswered summary nudge so the
+                    # transcript is exactly what it was before this attempt.
+                    final_response = None
+                    if messages and messages[-1] is nudge:
+                        messages.pop()
             break
 
     except InterruptedError:

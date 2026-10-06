@@ -553,6 +553,15 @@ def finalize_turn(
             _pending_verification_response_previewed=_pending_verification_response_previewed,
             logger=logger,
         )
+        # The budget fallback has its own commit point: the production summary is gated
+        # BEFORE its first assistant-row append, so a DROP/refusal recorded there is
+        # already terminal. Adopt it now — before _persist_step runs stream recovery,
+        # the tail close and persistence over a candidate that no longer exists.
+        _after_fallback = final_output_disposition(agent, turn_id)
+        if _after_fallback in TERMINAL_VERDICTS:
+            _final_output = _after_fallback
+            _final_output_terminal = True
+            final_response = None
 
     # A non-interrupted turn that fell out of the loop after a tool result, with no
     # follow-up assistant text, is the Desktop/TUI "silent stop" (#55316, #54756): the

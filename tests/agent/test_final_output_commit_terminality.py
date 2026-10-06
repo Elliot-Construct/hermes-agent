@@ -515,3 +515,234 @@ def test_stale_disposition_does_not_leak_into_the_next_turn(monkeypatch):
 
     reset_final_output_disposition(agent)
     assert agent._final_output_disposition is None
+
+
+# ============ production-shaped producers (re-review at 0e25ab97f7, 2026-10-05) ============
+#
+# Both remaining P1s concern PRODUCTION producers that earlier regressions stood in for
+# with doubles: `handle_max_iterations()` appends the summary row itself, and the codex
+# app-server fast path returns before either generic gate owner.
+
+_CODEX_FINAL = "TOP-SECRET-CODEX-FINAL"
+_SUMMARY_TEXT = "MODEL-SUMMARY-SECRET"
+
+
+def test_production_max_iteration_summary_is_gated_before_its_first_append(monkeypatch, loop_agent):
+    """P1 #1: production `handle_max_iterations()` APPENDS the summary row before the
+    finalizer's gate sees it, so a late DROP left the row durable and replayable.
+
+    Production producer, only the provider attempt mocked: zero assistant-row durability,
+    zero returned candidate, zero next-turn replay, one gate evaluation.
+    """
+    gated: list = []
+
+    def gate(**kwargs):
+        gated.append(kwargs["candidate"]["content"])
+        return "drop"
+
+    _install_gate(monkeypatch, gate)
+    # The only provider-side mock: every producer statement after this (nudge append,
+    # api_messages build, assistant-row append) runs for real.
+    monkeypatch.setattr(
+        "agent.chat_completion_helpers._chat_summary_attempt",
+        lambda agent, api_messages, request_id: (lambda retry_count: _SUMMARY_TEXT),
+    )
+
+    agent = loop_agent
+    agent._current_turn_id = "turn"
+    persist_patch, persisted = _recording_persist(agent)
+    with (
+        persist_patch,
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = _finalize(
+            agent,
+            api_call_count=agent.max_iterations,
+            messages=[{"role": "user", "content": "do the work"}],
+            _turn_exit_reason="unknown",
+        )
+
+    # One evaluation, at the producer — before any append.
+    assert gated == [_SUMMARY_TEXT]
+    # Zero assistant-row durability (the snapshot finalize_turn actually persisted) ...
+    assert persisted, "finalize_turn never persisted the transcript"
+    assert _SUMMARY_TEXT not in _content_rows(persisted)
+    # ... zero returned candidate, zero next-turn replay ...
+    assert result["final_response"] is None
+    assert result["final_output_disposition"] == "drop"
+    assert result["completed"] is False
+    assert _SUMMARY_TEXT not in _content_rows([result["messages"]])
+    # ... and the production producer really was the one that ran (the unanswered
+    # summary nudge it appended is popped again on a terminal verdict).
+    assert [row.get("role") for row in result["messages"]] == ["user"]
+
+
+def _codex_events_recorder(monkeypatch, events: list):
+    """Record the gate/persist ordering on the codex fast path."""
+    from agent import codex_runtime
+
+    original = codex_runtime._persist_projected_messages
+
+    def wrapper(agent, turn, messages):
+        events.append("persist")
+        return original(agent, turn, messages)
+
+    monkeypatch.setattr(codex_runtime, "_persist_projected_messages", wrapper)
+
+
+def _codex_agent_with_recorders(events: list, gated: list, memory: list):
+    from tests.agent.test_codex_app_server_integration import _make_codex_agent
+
+    agent = _make_codex_agent()
+    agent._sync_external_memory_for_turn = lambda **kwargs: memory.append(
+        kwargs.get("final_response")
+    )
+    agent._spawn_background_review = MagicMock()
+    agent._current_turn_id = "turn"
+    return agent
+
+
+@pytest.fixture
+def codex_secret_session(monkeypatch):
+    """Codex app-server stub whose turn ends on a final candidate plus tool rows."""
+    from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+
+    def fake_run_turn(self, user_input, **kwargs):
+        return TurnResult(
+            final_text=_CODEX_FINAL,
+            projected_messages=[
+                {"role": "assistant", "content": None,
+                 "tool_calls": [{"id": "exec_1", "type": "function",
+                                 "function": {"name": "exec_command", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "exec_1", "content": "ok"},
+                {"role": "assistant", "content": _CODEX_FINAL},
+            ],
+            tool_iterations=1,
+            interrupted=False,
+            error=None,
+            turn_id="turn-codex-1",
+            thread_id="thread-codex-1",
+        )
+
+    monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+    monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1")
+
+
+def test_codex_fast_path_drops_the_candidate_before_persist_and_return(monkeypatch, codex_secret_session):
+    """P1 #2 (DROP): `_run_conversation_turn` returns the codex result before either
+    generic gate owner, so the decision has to happen on that path — before projected
+    persistence, before the consumers, before the return."""
+    events: list = []
+    gated: list = []
+    memory: list = []
+
+    def gate(**kwargs):
+        gated.append(kwargs["candidate"]["content"])
+        events.append("gate")
+        return "drop"
+
+    _install_gate(monkeypatch, gate)
+    _codex_events_recorder(monkeypatch, events)
+    agent = _codex_agent_with_recorders(events, gated, memory)
+    persist_patch, _ = _recording_persist(agent)
+
+    with (
+        persist_patch,
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do the thing")
+
+    # The decision ran first; persistence ran second, already without the candidate.
+    assert events == ["gate", "persist"], "the gate must precede projected persistence"
+    assert gated == [_CODEX_FINAL]
+    assert result["final_response"] is None
+    assert result["completed"] is False
+    assert result["final_output_disposition"] == "drop"
+    assert _CODEX_FINAL not in _content_rows([result["messages"]])
+    # The turn's other projected rows stay durable.
+    assert any(
+        isinstance(row, dict) and row.get("role") == "tool" for row in result["messages"]
+    )
+    # Consumers saw the committed candidate: None, never the dropped text.
+    assert memory == [None]
+    assert agent._spawn_background_review.call_count == 0
+
+
+def test_codex_fast_path_allows_the_candidate_and_delivers_it(monkeypatch, codex_secret_session):
+    """Control: an allowing gate keeps the codex path exactly as it was."""
+    events: list = []
+    gated: list = []
+    memory: list = []
+
+    def gate(**kwargs):
+        gated.append(kwargs["candidate"]["content"])
+        events.append("gate")
+        return "allow"
+
+    _install_gate(monkeypatch, gate)
+    _codex_events_recorder(monkeypatch, events)
+    agent = _codex_agent_with_recorders(events, gated, memory)
+    persist_patch, _ = _recording_persist(agent)
+
+    with (
+        persist_patch,
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do the thing")
+
+    assert events == ["gate", "persist"]
+    assert gated == [_CODEX_FINAL]
+    assert result["final_response"] == _CODEX_FINAL
+    assert result["completed"] is True
+    assert "final_output_disposition" not in result
+    assert _CODEX_FINAL in _content_rows([result["messages"]])
+    assert memory == [_CODEX_FINAL]
+
+
+def test_codex_fast_path_refusal_settles_without_consuming_the_text(monkeypatch, codex_secret_session):
+    """P1 #2 (refusal): a fail-closed gate on the codex path settles in place — failed,
+    non-retryable, no candidate row, no consumer sees the text, no background review."""
+    gated: list = []
+    memory: list = []
+
+    def gate(**kwargs):
+        gated.append(kwargs["candidate"]["content"])
+        raise RuntimeError("commit gate unavailable")
+
+    _install_gate(monkeypatch, gate, failure_mode="closed")
+    _codex_events_recorder(monkeypatch, [])
+    agent = _codex_agent_with_recorders([], gated, memory)
+    persist_patch, _ = _recording_persist(agent)
+    messages = [{"role": "user", "content": "do the thing"}]
+
+    from agent.codex_runtime import run_codex_app_server_turn
+
+    with (
+        persist_patch,
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="do the thing",
+            original_user_message="do the thing",
+            messages=messages,
+            effective_task_id=None,
+            should_review_memory=True,
+        )
+
+    assert gated == [_CODEX_FINAL]
+    assert result["final_output_disposition"] == "refused"
+    assert result["failed"] is True
+    assert result["failure_reason"] == "llm_stream_middleware_refusal"
+    assert result["failure_retryable"] is False
+    assert result["final_response"] is None
+    assert result["completed"] is False
+    assert _CODEX_FINAL not in _content_rows([messages])
+    assert memory == [None]
+    assert agent._spawn_background_review.call_count == 0, (
+        "a refused candidate must never reach the background-review consumer"
+    )
